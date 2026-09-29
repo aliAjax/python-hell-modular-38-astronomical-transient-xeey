@@ -3,31 +3,338 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>天文瞬变事件警报与后续观测</title>
+  <title>巡天夜观测时间窗竞争排程</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 860px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    :root { --border: #d1d5db; --muted: #6b7280; --bg: #f9fafb; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; margin: 1.5rem; color: #1f2937; background: var(--bg); }
+    main { max-width: 1080px; margin: auto; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+    .panel { background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .6rem; }
+    label { font-size: .78rem; color: var(--muted); display: flex; flex-direction: column; gap: .25rem; }
+    input, select { padding: .4rem .5rem; border: 1px solid var(--border); border-radius: 6px; font-size: .9rem; }
+    button { padding: .45rem .9rem; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; font-size: .85rem; }
+    button.secondary { background: #6b7280; }
+    button.danger { background: #b91c1c; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; font-size: .83rem; background: #fff; }
+    th, td { border-bottom: 1px solid var(--border); padding: .5rem .55rem; text-align: left; vertical-align: top; }
+    th { background: #f3f4f6; position: sticky; top: 0; }
+    .tag { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .74rem; color: #fff; }
+    .scheduled { background: #059669; }
+    .requested { background: #d97706; }
+    .completed { background: #4b5563; }
+    .withdrawn { background: #9ca3af; }
+    .reason { color: #b91c1c; font-size: .78rem; margin-top: .25rem; }
+    .meta { color: var(--muted); font-size: .74rem; word-break: break-all; }
+    .toolbar { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
+    #message { font-size: .85rem; white-space: pre-wrap; }
+    .ok { color: #047857; }
+    .err { color: #b91c1c; }
+    details summary { cursor: pointer; font-size: .9rem; font-weight: 600; }
+    code { background: #f3f4f6; padding: 0 .25rem; border-radius: 4px; }
   </style>
 </head>
 <body>
 <main>
-  <h1>天文瞬变事件警报与后续观测</h1>
-  <p>候选事件、测量合并、望远镜观测申请和审计通过JSON接口管理。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-POST /api/entities/&lt;id&gt;/actions
-GET  /api/audit</pre>
+  <h1>巡天夜观测时间窗竞争排程</h1>
+  <p class="meta">
+    同一望远镜时间窗重叠时：高优先级顶掉<b>尚未开始</b>的低优先级计划，被顶申请回到待排并写明原因；
+    同优先级保留先提交的；已经开始的计划不能顶。计划完成或撤回后，原时段才能重新排。
+  </p>
+
+  <div class="toolbar">
+    <label style="flex-direction:row;align-items:center;gap:.4rem">
+      当前身份
+      <select id="role">
+        <option value="coordinator">协调员 coordinator（可排程/建望远镜）</option>
+        <option value="analyst">分析员 analyst（提交申请/撤回）</option>
+        <option value="operator">操作员 operator（标记完成）</option>
+        <option value="viewer">观察员 viewer（只读）</option>
+      </select>
+    </label>
+    <button class="secondary" onclick="loadAll()">刷新</button>
+    <label style="flex-direction:row;align-items:center;gap:.3rem;font-size:.8rem">
+      <input type="checkbox" id="autorefresh" checked> 每10秒自动刷新
+    </label>
+  </div>
+  <div id="message" class="meta"></div>
+
+  <details class="panel">
+    <summary>新建基础数据（巡天来源 / 候选事件 / 望远镜）</summary>
+    <h2>巡天来源</h2>
+    <div class="grid">
+      <label>来源名称<input id="src_name" value="ZTF-night"></label>
+      <label>巡天项目<input id="src_survey" value="ZTF"></label>
+    </div>
+    <p><button onclick="createSource()">创建来源</button></p>
+
+    <h2>瞬变候选事件（越亮、类型越紧急，优先级越高）</h2>
+    <div class="grid">
+      <label>来源
+        <select id="cand_source"></select>
+      </label>
+      <label>事件编号<input id="cand_event" placeholder="AT-2026-xxx"></label>
+      <label>类型
+        <select id="cand_type">
+          <option value="grb">grb（伽马暴）</option>
+          <option value="supernova" selected>supernova（超新星）</option>
+          <option value="tde">tde（潮汐瓦解）</option>
+          <option value="variable">variable（变源）</option>
+          <option value="unknown">unknown</option>
+        </select>
+      </label>
+      <label>星等（越小越亮）<input id="cand_mag" type="number" step="0.1" value="17"></label>
+      <label>RA (0-360)<input id="cand_ra" type="number" step="0.01" value="120.5"></label>
+      <label>Dec (-90-90)<input id="cand_dec" type="number" step="0.01" value="-12.25"></label>
+      <label>发现时间<input id="cand_at" type="datetime-local"></label>
+    </div>
+    <p><button onclick="createCandidate()">创建候选事件</button></p>
+
+    <h2>望远镜</h2>
+    <div class="grid">
+      <label>名称<input id="tel_name" value="North 2m"></label>
+      <label>口径(米)<input id="tel_aperture" type="number" step="0.1" value="2"></label>
+      <label>台址<input id="tel_site" value="NAO"></label>
+    </div>
+    <p><button onclick="createTelescope()">创建望远镜</button></p>
+  </details>
+
+  <div class="panel">
+    <h2 style="margin-top:0">提交观测申请</h2>
+    <div class="grid">
+      <label>候选事件<select id="obs_candidate"></select></label>
+      <label>望远镜<select id="obs_telescope"></select></label>
+      <label>观测队伍<input id="obs_team" placeholder="team-north"></label>
+      <label>模式
+        <select id="obs_mode"><option>imaging</option><option>spectroscopy</option></select>
+      </label>
+      <label>开始<input id="obs_start" type="datetime-local"></label>
+      <label>结束<input id="obs_end" type="datetime-local"></label>
+    </div>
+    <p><button onclick="createObservation()">提交申请</button>
+       <span class="meta">优先级在提交时按候选事件快照，显示在排队结果中。</span></p>
+  </div>
+
+  <div class="panel" style="padding:0;overflow:hidden">
+    <h2 style="padding:1rem 1.2rem 0">排队结果（按望远镜分组）</h2>
+    <div style="padding:0 1.2rem 1rem;overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>状态</th><th>望远镜</th><th>事件</th><th>队伍</th>
+            <th>时间窗</th><th>优先级</th><th>排队原因</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="queue_rows"><tr><td colspan="8" class="meta">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 </main>
+
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const ROLE_TO_VERB = { coordinator: '协调员', analyst: '分析员', operator: '操作员', viewer: '观察员' };
+
+function role() { return document.getElementById('role').value; }
+function headers(extra = {}) {
+  return Object.assign({
+    'Content-Type': 'application/json',
+    'X-User-Id': 'web-' + role(),
+    'X-Role': role(),
+  }, extra);
 }
+function utc(value) {
+  if (!value) return value;
+  const d = new Date(value);
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+function localInput(offsetHours = 1) {
+  const d = new Date(Date.now() + offsetHours * 3600000);
+  d.setSeconds(0, 0);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fmtWindow(s, e) {
+  const cut = v => (v || '').replace('T', ' ').replace('Z', ' UTC');
+  return `${cut(s)}<br>→ ${cut(e)}`;
+}
+function setMessage(text, ok = true) {
+  const el = document.getElementById('message');
+  el.textContent = text;
+  el.className = ok ? 'ok' : 'err';
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(`${payload.type || 'Error'}: ${payload.error || response.status}`);
+  }
+  return payload;
+}
+async function postJson(path, body) {
+  return api(path, { method: 'POST', headers: headers(), body: JSON.stringify(body) });
+}
+async function action(id, act, data = {}) {
+  return postJson(`/api/entities/${id}/actions`, Object.assign({ action: act }, data));
+}
+
+async function createSource() {
+  try {
+    await postJson('/api/sources', {
+      name: document.getElementById('src_name').value,
+      survey_name: document.getElementById('src_survey').value,
+    });
+    setMessage('巡天来源已创建');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+async function createCandidate() {
+  try {
+    await postJson('/api/candidates', {
+      source_id: document.getElementById('cand_source').value,
+      event_id: document.getElementById('cand_event').value,
+      transient_type: document.getElementById('cand_type').value,
+      magnitude: parseFloat(document.getElementById('cand_mag').value),
+      ra: parseFloat(document.getElementById('cand_ra').value),
+      dec: parseFloat(document.getElementById('cand_dec').value),
+      observed_at: utc(document.getElementById('cand_at').value),
+    });
+    setMessage('候选事件已创建');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+async function createTelescope() {
+  try {
+    await postJson('/api/telescopes', {
+      name: document.getElementById('tel_name').value,
+      aperture_m: parseFloat(document.getElementById('tel_aperture').value),
+      site_name: document.getElementById('tel_site').value,
+    });
+    setMessage('望远镜已创建');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+async function createObservation() {
+  try {
+    const result = await postJson('/api/observations', {
+      candidate_id: document.getElementById('obs_candidate').value,
+      telescope_id: document.getElementById('obs_telescope').value,
+      team_id: document.getElementById('obs_team').value,
+      mode: document.getElementById('obs_mode').value,
+      start_at: utc(document.getElementById('obs_start').value),
+      end_at: utc(document.getElementById('obs_end').value),
+    });
+    setMessage(`申请已提交（${result.id.slice(0, 8)}…），优先级 ${result.data.priority}，等待协调员排程`);
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+
+async function schedulePlan(id) {
+  try {
+    const result = await action(id, 'schedule', { operator_id: 'web-operator' });
+    const bumped = (result.preempted || []).length;
+    setMessage(bumped
+      ? `排程成功，顶回了 ${bumped} 个重叠的低优先级/较晚提交计划：${result.preempted.join(', ')}`
+      : '排程成功，无冲突');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); await loadAll(); }
+}
+async function completePlan(id) {
+  try {
+    await action(id, 'complete', { quality: 'good' });
+    setMessage('计划已完成，原时段释放');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+async function withdrawPlan(id) {
+  const reason = prompt('撤回原因：', '天气原因');
+  if (reason === null) return;
+  try {
+    await action(id, 'withdraw', { reason });
+    setMessage('计划已撤回，原时段释放');
+    await loadAll();
+  } catch (e) { setMessage(e.message, false); }
+}
+
+const STATUS_CN = { scheduled: '已排程', requested: '待排', completed: '已完成', withdrawn: '已撤回' };
+
+function option(value, label) {
+  const el = document.createElement('option');
+  el.value = value;
+  el.textContent = label;
+  return el;
+}
+
+async function loadAll() {
+  try {
+    const [sources, candidates, telescopes, queue] = await Promise.all([
+      api('/api/sources'), api('/api/candidates'), api('/api/telescopes'), api('/api/queue'),
+    ]);
+
+    const candSelect = document.getElementById('obs_candidate');
+    candSelect.innerHTML = '';
+    candidates.items.forEach(c => candSelect.appendChild(
+      option(c.id, `${c.data.event_key}（优先级 ${c.data.priority_score}）`)));
+    const telSelect = document.getElementById('obs_telescope');
+    telSelect.innerHTML = '';
+    telescopes.items.forEach(t => telSelect.appendChild(option(t.id, `${t.data.name} @ ${t.data.site_name}`)));
+
+    const sourceSelect = document.getElementById('cand_source');
+    sourceSelect.innerHTML = '';
+    sources.items.forEach(s => sourceSelect.appendChild(option(s.id, `${s.data.name} (${s.data.survey_name})`)));
+
+    const tbody = document.getElementById('queue_rows');
+    tbody.innerHTML = '';
+    if (!queue.items.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="meta">还没有观测申请</td></tr>';
+      return;
+    }
+    let lastTel = null;
+    for (const item of queue.items) {
+      if (lastTel !== item.telescope_id) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td colspan="8" style="background:#eef2ff;font-weight:600">
+          望远镜：${item.telescope_name || item.telescope_id}</td>`;
+        tbody.appendChild(tr);
+        lastTel = item.telescope_id;
+      }
+      const tr = document.createElement('tr');
+      const statusTag = `<span class="tag ${item.status}">${STATUS_CN[item.status] || item.status}</span>`
+        + (item.status === 'scheduled' && item.started ? '<div class="meta">观测中（已开始，不可顶）</div>' : '');
+      let reason = '';
+      if (item.queue_reason) reason = `<div class="reason">${item.queue_reason}</div>`;
+      else if (item.status === 'requested') reason = '<div class="meta">等待协调员排程</div>';
+      let ops = '';
+      if (item.status === 'requested') {
+        ops = `<button onclick="schedulePlan('${item.id}')">排程（参与时间窗竞争）</button>`;
+      } else if (item.status === 'scheduled') {
+        ops = `<button class="secondary" onclick="completePlan('${item.id}')">标记完成</button>
+               <button class="danger" onclick="withdrawPlan('${item.id}')">撤回</button>`;
+      }
+      tr.innerHTML = `
+        <td>${statusTag}</td>
+        <td>${item.telescope_name || item.telescope_id}</td>
+        <td>${item.event_id || item.candidate_id}<div class="meta">${item.mode || ''}</div></td>
+        <td>${item.team_id}</td>
+        <td>${fmtWindow(item.start_at, item.end_at)}</td>
+        <td>${Number(item.priority).toFixed(1)}</td>
+        <td>${reason}</td>
+        <td>${ops}</td>`;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    document.getElementById('queue_rows').innerHTML =
+      `<tr><td colspan="8" class="err">${e.message}</td></tr>`;
+  }
+}
+
+document.getElementById('cand_at').value = localInput(-1);
+document.getElementById('obs_start').value = localInput(1);
+document.getElementById('obs_end').value = localInput(2);
+loadAll();
+setInterval(() => { if (document.getElementById('autorefresh').checked) loadAll(); }, 10000);
 </script>
 </body>
 </html>

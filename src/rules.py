@@ -1,4 +1,53 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def current_stamp(moment=None):
+    """Lexicographically comparable UTC stamp matching the ``...Z`` window format."""
+    moment = moment or datetime.now(timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def window_has_started(start_at, moment=None):
+    return str(start_at) <= current_stamp(moment)
+
+
+def observation_priority(entity):
+    try:
+        return float((entity.get("data") or {}).get("priority", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _submitted_order(entity):
+    # ``seq`` is the SQLite insertion rowid; created_at + id are the fallback.
+    return (str(entity.get("created_at", "")), entity.get("seq") or 0, str(entity.get("id", "")))
+
+
+def submitted_earlier(first, second):
+    return _submitted_order(first) < _submitted_order(second)
+
+
+def preempt_reason(loser, winner, stamp):
+    loser_priority = observation_priority(loser)
+    winner_priority = observation_priority(winner)
+    data = loser.get("data") or {}
+    if winner_priority == loser_priority:
+        cause = "同优先级按提交时间排序，本申请提交较晚"
+    else:
+        cause = "本申请优先级 %.2f 低于对方 %.2f" % (loser_priority, winner_priority)
+    return (
+        "被更高优先级观测申请 %s 顶回待排：%s；望远镜 %s 的 %s~%s 时间窗于 %s 让出"
+        % (
+            winner.get("id"),
+            cause,
+            data.get("telescope_id"),
+            data.get("start_at"),
+            data.get("end_at"),
+            stamp,
+        )
+    )
 
 
 def _find_one(lookup, kind, field, value):
@@ -73,13 +122,17 @@ def _validate_telescope(actor, data, lookup):
 
 
 def _validate_observation(actor, data, lookup):
-    if not _find_one(lookup, "candidate", "id", data.get("candidate_id")):
+    candidate = _find_one(lookup, "candidate", "id", data.get("candidate_id"))
+    if not candidate:
         raise ValidationError("candidate does not exist")
     if not _find_one(lookup, "telescope", "id", data.get("telescope_id")):
         raise ValidationError("telescope does not exist")
     if str(data.get("start_at")) >= str(data.get("end_at")):
         raise ValidationError("observation end must be after start")
-    return {"scheduled_team": data.get("team_id")}
+    return {
+        "scheduled_team": data.get("team_id"),
+        "priority": candidate["data"].get("priority_score", 0.0),
+    }
 
 
 def _validate_merge_measurement(actor, entity, data, lookup):
@@ -123,28 +176,6 @@ def _validate_correct(actor, entity, data, lookup):
 
 
 def _validate_schedule(actor, entity, data, lookup):
-    observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
-    for other in observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
-            continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
-            raise ConflictError("telescope is already scheduled in this window")
-    team_observations = lookup("observation", "team_id", entity["data"].get("team_id")) if lookup else []
-    for other in team_observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
-            continue
-        if measurements_overlap(
-            entity["data"].get("start_at"),
-            entity["data"].get("end_at"),
-            other["data"].get("start_at"),
-            other["data"].get("end_at"),
-        ):
-            raise ConflictError("observation team is already committed in this window")
     return {"scheduled_by": actor.user_id}
 
 
@@ -180,6 +211,7 @@ class RuleEngine:
         },
         "observation": {
             "schedule": (("requested",), "scheduled"),
+            "preempt": (("scheduled",), "requested"),
             "complete": (("scheduled",), "completed"),
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
@@ -285,3 +317,62 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def evaluate_telescope_contest(self, entity, scheduled_observations, moment=None):
+        """Rank ``entity`` against the scheduled plans on the same telescope.
+
+        Returns the list of overlapping plans that must be bumped back to the
+        queue. Plans that have already started, or that keep their slot under
+        the priority/submission-time tie-break, raise a conflict instead.
+        """
+        start_at = entity["data"].get("start_at")
+        end_at = entity["data"].get("end_at")
+        losers = []
+        for other in scheduled_observations:
+            if other["id"] == entity["id"] or other["status"] != "scheduled":
+                continue
+            if not measurements_overlap(
+                start_at,
+                end_at,
+                other["data"].get("start_at"),
+                other["data"].get("end_at"),
+            ):
+                continue
+            if window_has_started(other["data"].get("start_at"), moment):
+                raise ConflictError(
+                    "telescope plan %s has already started in this window and cannot be preempted"
+                    % other["id"]
+                )
+            if observation_priority(entity) < observation_priority(other):
+                raise ConflictError(
+                    "telescope is already scheduled in this window by higher priority plan %s"
+                    % other["id"]
+                )
+            if observation_priority(entity) == observation_priority(other) and not submitted_earlier(
+                entity, other
+            ):
+                raise ConflictError(
+                    "telescope is already scheduled in this window by earlier submitted plan %s "
+                    "with the same priority" % other["id"]
+                )
+            losers.append(other)
+        return losers
+
+    def ensure_team_available(self, entity, scheduled_observations, bumped_ids=()):
+        """A team cannot run two overlapping plans, even on different telescopes."""
+        start_at = entity["data"].get("start_at")
+        end_at = entity["data"].get("end_at")
+        for other in scheduled_observations:
+            if other["id"] == entity["id"] or other["id"] in set(bumped_ids):
+                continue
+            if other["status"] != "scheduled":
+                continue
+            if other["data"].get("team_id") != entity["data"].get("team_id"):
+                continue
+            if measurements_overlap(
+                start_at,
+                end_at,
+                other["data"].get("start_at"),
+                other["data"].get("end_at"),
+            ):
+                raise ConflictError("observation team is already committed in this window")

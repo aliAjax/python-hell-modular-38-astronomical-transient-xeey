@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -18,6 +19,19 @@ class SQLiteRepository:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @contextmanager
+    def transaction(self):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize(self):
         with self._connect() as connection:
@@ -63,11 +77,21 @@ class SQLiteRepository:
             "kind": row["kind"],
             "status": row["status"],
             "version": int(row["version"]),
+            "seq": int(row["seq"]),
             "data": json.loads(row["data"]),
             "created_by": row["created_by"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    @staticmethod
+    def _row_columns(prefix=""):
+        qualifier = (prefix + ".") if prefix else ""
+        return (
+            " %sid, %skind, %sstatus, %sversion, %srowid AS seq, %sdata, "
+            "%screated_by, %screated_at, %supdated_at"
+            % ((qualifier,) * 9)
+        )
 
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
@@ -80,14 +104,17 @@ class SQLiteRepository:
             )
         return self.get_entity(entity_id)
 
+    def _select_entity(self, connection, entity_id):
+        return connection.execute(
+            "SELECT" + self._row_columns() + " FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+
     def get_entity(self, entity_id):
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
+            row = self._select_entity(connection, entity_id)
         return self._entity_from_row(row) if row else None
 
-    def list_entities(self, kind=None, status=None):
+    def list_entities(self, kind=None, status=None, connection=None):
         clauses = []
         params = []
         if kind:
@@ -97,41 +124,51 @@ class SQLiteRepository:
             clauses.append("status = ?")
             params.append(status)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
-            ).fetchall()
+        sql = "SELECT" + self._row_columns() + " FROM entities" + where + " ORDER BY created_at, id"
+
+        def _query(connection):
+            return connection.execute(sql, params).fetchall()
+
+        if connection is not None:
+            rows = _query(connection)
+        else:
+            with self._connect() as connection:
+                rows = _query(connection)
         return [self._entity_from_row(row) for row in rows]
 
-    def find_entities(self, kind, field, value):
+    def find_entities(self, kind, field, value, connection=None):
         return [
             entity
-            for entity in self.list_entities(kind=kind)
+            for entity in self.list_entities(kind=kind, connection=connection)
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
 
-    def update_entity(self, entity_id, expected_version, status, data):
+    def _write_entity(self, connection, entity_id, expected_version, status, data):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, now, entity_id, current_version),
+        )
+        return current_version
+
+    def update_entity(self, entity_id, expected_version, status, data):
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT version FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
-            if not row:
-                raise NotFoundError("entity not found: " + entity_id)
-            current_version = int(row["version"])
-            if expected_version is not None and current_version != int(expected_version):
-                raise ConflictError(
-                    "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
-                )
-            connection.execute(
-                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (status, payload, now, entity_id, current_version),
-            )
+            self._write_entity(connection, entity_id, expected_version, status, data)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -140,21 +177,33 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def _insert_audit(self, connection, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entity_id,
-                    actor_id,
-                    actor_role,
-                    action,
-                    from_status,
-                    to_status,
-                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
-                    utcnow(),
-                ),
+            self._insert_audit(
+                connection,
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                detail,
             )
 
     def list_audit(self, entity_id=None):
