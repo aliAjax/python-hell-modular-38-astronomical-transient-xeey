@@ -3,31 +3,398 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>天文瞬变事件警报与后续观测</title>
+  <title>瞬变事件望远镜时间窗排队</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 860px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    :root {
+      color-scheme: light;
+      --border: #d1d5db;
+      --muted: #6b7280;
+      --primary: #1d4ed8;
+      --danger-bg: #fef2f2;
+      --danger-text: #991b1b;
+      --ok-bg: #ecfdf5;
+      --ok-text: #065f46;
+      --wait-bg: #fffbeb;
+      --wait-text: #92400e;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f9fafb; color: #111827; }
+    main { max-width: 1120px; margin: auto; padding: 2rem 1rem 4rem; }
+    h1 { margin-bottom: .25rem; }
+    h2 { margin-top: 2rem; }
+    .hint { color: var(--muted); margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; }
+    fieldset { border: 1px solid var(--border); border-radius: 10px; padding: 1rem; background: #fff; }
+    legend { font-weight: 700; padding: 0 .35rem; }
+    label { display: grid; gap: .25rem; font-size: .9rem; font-weight: 600; }
+    input, select, button, textarea { font: inherit; }
+    input, select, textarea { box-sizing: border-box; width: 100%; padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+    button { padding: .55rem .9rem; border: 0; border-radius: 6px; background: var(--primary); color: #fff; cursor: pointer; }
+    button.secondary { background: #374151; }
+    button.danger { background: #b91c1c; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin: 1rem 0; }
+    .status { margin-left: auto; font-weight: 700; }
+    .status.ok { color: var(--ok-text); }
+    .status.bad { color: var(--danger-text); }
+    .message { white-space: pre-wrap; border-radius: 8px; padding: .8rem 1rem; background: #f3f4f6; }
+    .message.ok { background: var(--ok-bg); color: var(--ok-text); }
+    .message.error { background: var(--danger-bg); color: var(--danger-text); }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    th, td { padding: .7rem .75rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; font-size: .88rem; }
+    th { background: #f3f4f6; white-space: nowrap; }
+    tr:last-child td { border-bottom: 0; }
+    .pill { display: inline-block; padding: .15rem .5rem; border-radius: 999px; font-weight: 700; font-size: .78rem; }
+    .pill.scheduled { background: var(--ok-bg); color: var(--ok-text); }
+    .pill.requested { background: var(--wait-bg); color: var(--wait-text); }
+    .pill.completed { background: #eff6ff; color: #1e40af; }
+    .pill.withdrawn { background: #f3f4f6; color: #374151; }
+    .reason { color: var(--danger-text); }
+    .actions { display: flex; gap: .35rem; flex-wrap: wrap; }
+    .actions button { padding: .35rem .55rem; font-size: .8rem; }
+    code { background: #f3f4f6; padding: .1rem .25rem; border-radius: 4px; }
   </style>
 </head>
 <body>
 <main>
-  <h1>天文瞬变事件警报与后续观测</h1>
-  <p>候选事件、测量合并、望远镜观测申请和审计通过JSON接口管理。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-POST /api/entities/&lt;id&gt;/actions
-GET  /api/audit</pre>
+  <h1>瞬变事件望远镜时间窗排队</h1>
+  <p class="hint">提交观测申请后由协调员排程；同望远镜高优先级计划可顶掉尚未开始的低优先级计划，同优先级先提交者保留。</p>
+
+  <div class="toolbar">
+    <button class="secondary" onclick="checkHealth()">检查服务</button>
+    <button onclick="loadAll()">刷新全部</button>
+    <span id="health" class="status">尚未检查</span>
+  </div>
+  <pre id="message" class="message">等待操作</pre>
+
+  <h2>1. 准备事件和望远镜</h2>
+  <div class="grid">
+    <fieldset>
+      <legend>巡天来源</legend>
+      <form id="source-form" class="grid">
+        <label>来源名称<input name="name" value="Nightly Survey" required></label>
+        <label>巡天项目<input name="survey_name" value="ZTF-like" required></label>
+        <button type="submit">创建来源</button>
+      </form>
+    </fieldset>
+
+    <fieldset>
+      <legend>瞬变事件</legend>
+      <form id="candidate-form" class="grid">
+        <label>来源<select name="source_id" data-kind="source" data-label="name" required></select></label>
+        <label>事件编号<input name="event_id" value="AT-2026-002" required></label>
+        <label>赤经 RA<input name="ra" type="number" min="0" max="359.999" step="0.001" value="120.5" required></label>
+        <label>赤纬 Dec<input name="dec" type="number" min="-90" max="90" step="0.001" value="-12.25" required></label>
+        <label>星等（越小优先级越高）<input name="magnitude" type="number" step="0.01" value="17.2" required></label>
+        <label>类型
+          <select name="transient_type">
+            <option value="grb">GRB（最高权重）</option>
+            <option value="supernova" selected>超新星</option>
+            <option value="tde">TDE</option>
+            <option value="unknown">未知</option>
+            <option value="variable">变源</option>
+          </select>
+        </label>
+        <label>发现时间<input name="observed_at" value="2026-09-29T00:00:00Z" required></label>
+        <button type="submit">创建事件</button>
+      </form>
+    </fieldset>
+
+    <fieldset>
+      <legend>望远镜</legend>
+      <form id="telescope-form" class="grid">
+        <label>名称<input name="name" value="North 2m" required></label>
+        <label>口径（米）<input name="aperture_m" type="number" min="0.1" step="0.1" value="2.0" required></label>
+        <label>站点<input name="site_name" value="NAO" required></label>
+        <button type="submit">创建望远镜</button>
+      </form>
+    </fieldset>
+  </div>
+
+  <h2>2. 提交观测申请</h2>
+  <form id="observation-form" class="grid">
+    <label>申请人<input name="requester_id" value="analyst-1"></label>
+    <label>角色
+      <select name="requester_role">
+        <option value="analyst" selected>analyst</option>
+        <option value="coordinator">coordinator</option>
+        <option value="admin">admin</option>
+      </select>
+    </label>
+    <label>瞬变事件<select name="candidate_id" data-kind="candidate" required></select></label>
+    <label>望远镜<select name="telescope_id" data-kind="telescope" data-label="name" required></select></label>
+    <label>队伍<input name="team_id" value="team-north" required></label>
+    <label>开始（UTC ISO-8601）<input name="start_at" value="2099-01-01T10:00:00Z" required></label>
+    <label>结束（UTC ISO-8601）<input name="end_at" value="2099-01-01T11:00:00Z" required></label>
+    <label>模式
+      <select name="mode">
+        <option value="imaging" selected>imaging</option>
+        <option value="spectroscopy">spectroscopy</option>
+      </select>
+    </label>
+    <button type="submit">提交申请</button>
+  </form>
+
+  <h2>3. 排队结果</h2>
+  <p class="hint">排程、完成和撤回使用协调员/操作员身份；被顶掉的申请会留在“待排”并显示原因。</p>
+  <div class="toolbar">
+    <label style="flex:1">排程协调员
+      <select id="coordinator-role">
+        <option value="coordinator" selected>coordinator-1 / coordinator</option>
+        <option value="admin">admin / admin</option>
+      </select>
+    </label>
+    <label style="flex:1">完成操作员<input id="operator-id" value="operator-1"></label>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>状态</th>
+        <th>事件</th>
+        <th>优先级</th>
+        <th>望远镜</th>
+        <th>队伍</th>
+        <th>时间窗</th>
+        <th>排队原因</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="observations"></tbody>
+  </table>
+
+  <h2>已有事件与望远镜</h2>
+  <div class="grid">
+    <section>
+      <h3>事件</h3>
+      <table><tbody id="candidates"></tbody></table>
+    </section>
+    <section>
+      <h3>望远镜</h3>
+      <table><tbody id="telescopes"></tbody></table>
+    </section>
+  </div>
 </main>
+
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+let candidates = [];
+let telescopes = [];
+let observations = [];
+
+function formData(form) {
+  return Object.fromEntries(new FormData(form).entries());
 }
+
+function headers(role, userId) {
+  return {
+    'Content-Type': 'application/json',
+    'X-Role': role || 'viewer',
+    'X-User-Id': userId || 'anonymous'
+  };
+}
+
+function setMessage(text, ok = true) {
+  const node = document.getElementById('message');
+  node.textContent = text;
+  node.className = 'message ' + (ok ? 'ok' : 'error');
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || ('HTTP ' + response.status));
+  }
+  return payload;
+}
+
+async function checkHealth() {
+  try {
+    const result = await api('/health');
+    const node = document.getElementById('health');
+    node.textContent = result.status === 'ok' ? '服务正常' : '服务异常';
+    node.className = 'status ' + (result.status === 'ok' ? 'ok' : 'bad');
+    await loadAll();
+  } catch (error) {
+    const node = document.getElementById('health');
+    node.textContent = '服务不可用';
+    node.className = 'status bad';
+    setMessage(error.message, false);
+  }
+}
+
+async function create(kind, payload, role, userId) {
+  return api('/api/' + kind, {
+    method: 'POST',
+    headers: headers(role, userId),
+    body: JSON.stringify(payload)
+  });
+}
+
+async function action(id, name, data, role, userId) {
+  return api('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST',
+    headers: headers(role, userId),
+    body: JSON.stringify(Object.assign({ action: name }, data ? { data } : {}))
+  });
+}
+
+function bindCreateForm(formId, kind, role, userId) {
+  document.getElementById(formId).addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.target;
+    try {
+      const result = await create(kind, formData(form), role, userId);
+      setMessage('已创建：' + result.id);
+      form.reset();
+      await loadAll();
+    } catch (error) {
+      setMessage(error.message, false);
+    }
+  });
+}
+
+bindCreateForm('source-form', 'source', 'analyst', 'analyst-1');
+bindCreateForm('telescope-form', 'telescope', 'coordinator', 'coordinator-1');
+
+document.getElementById('candidate-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const payload = formData(event.target);
+  payload.ra = Number(payload.ra);
+  payload.dec = Number(payload.dec);
+  payload.magnitude = Number(payload.magnitude);
+  try {
+    const result = await create('candidate', payload, 'analyst', 'analyst-1');
+    setMessage('已创建事件：' + result.id + '，优先级 ' + result.data.priority_score);
+    event.target.reset();
+    await loadAll();
+  } catch (error) {
+    setMessage(error.message, false);
+  }
+});
+
+document.getElementById('observation-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const payload = formData(event.target);
+  const role = payload.requester_role;
+  const userId = payload.requester_id;
+  delete payload.requester_role;
+  delete payload.requester_id;
+  try {
+    const result = await create('observation', payload, role, userId);
+    setMessage('申请已提交：' + result.id + '，当前状态为“待排”，优先级 ' + result.data.priority_score);
+    event.target.reset();
+    await loadAll();
+  } catch (error) {
+    setMessage(error.message, false);
+  }
+});
+
+async function scheduleObservation(id) {
+  const role = document.getElementById('coordinator-role').value;
+  try {
+    await action(id, 'schedule', { operator_id: document.getElementById('operator-id').value }, role, 'coordinator-1');
+    setMessage('排程请求已处理：' + id);
+    await loadAll();
+  } catch (error) {
+    setMessage('无法排程 ' + id + '：' + error.message, false);
+  }
+}
+
+async function completeObservation(id) {
+  try {
+    await action(id, 'complete', { quality: 'good' }, 'operator', document.getElementById('operator-id').value);
+    setMessage('计划已完成：' + id);
+    await loadAll();
+  } catch (error) {
+    setMessage(error.message, false);
+  }
+}
+
+async function withdrawObservation(id) {
+  const reason = prompt('请填写撤回原因', '申请人撤回，释放原时段');
+  if (!reason) return;
+  try {
+    await action(id, 'withdraw', { reason }, 'coordinator', 'coordinator-1');
+    setMessage('计划已撤回：' + id);
+    await loadAll();
+  } catch (error) {
+    setMessage(error.message, false);
+  }
+}
+
+function candidateLabel(item) {
+  const eventId = item.data.event_id || item.id;
+  const magnitude = item.data.latest_magnitude ?? item.data.magnitude ?? item.data.measurements?.[0]?.magnitude;
+  return eventId + ' / mag ' + magnitude + ' / P' + item.data.priority_score;
+}
+
+function telescopeLabel(item) {
+  return (item.data.name || item.id) + ' / ' + item.data.site_name;
+}
+
+function fillSelect(select, items, labeler) {
+  const current = select.value;
+  select.innerHTML = '<option value="">请选择</option>' + items.map(item =>
+    '<option value="' + item.id + '">' + labeler(item) + '</option>'
+  ).join('');
+  if (items.some(item => item.id === current)) select.value = current;
+}
+
+function renderSimpleRows(id, items, labeler) {
+  document.getElementById(id).innerHTML = items.map(item =>
+    '<tr><td>' + labeler(item) + '</td><td><code>' + item.id + '</code></td></tr>'
+  ).join('') || '<tr><td>暂无数据</td></tr>';
+}
+
+function renderObservations() {
+  const candidateMap = new Map(candidates.map(item => [item.id, item]));
+  const telescopeMap = new Map(telescopes.map(item => [item.id, item]));
+  document.getElementById('observations').innerHTML = observations.map((item, index) => {
+    const candidate = candidateMap.get(item.data.candidate_id);
+    const telescope = telescopeMap.get(item.data.telescope_id);
+    const reason = item.data.queue_reason
+      ? '<span class="reason">' + item.data.queue_reason + '</span>'
+      : '<span class="hint">—</span>';
+    const scheduled = item.status === 'scheduled';
+    const requested = item.status === 'requested';
+    return '<tr>'
+      + '<td>' + (index + 1) + '</td>'
+      + '<td><span class="pill ' + item.status + '">' + item.status + '</span></td>'
+      + '<td>' + (candidate ? candidateLabel(candidate) : item.data.candidate_id) + '</td>'
+      + '<td>' + (item.data.priority_score ?? '') + '</td>'
+      + '<td>' + (telescope ? telescope.data.name : item.data.telescope_id) + '</td>'
+      + '<td>' + (item.data.team_id || item.data.scheduled_team || '') + '</td>'
+      + '<td>' + item.data.start_at + '<br>至 ' + item.data.end_at + '</td>'
+      + '<td>' + reason + '</td>'
+      + '<td><div class="actions">'
+      + (requested ? '<button onclick="scheduleObservation(\'' + item.id + '\')">排程</button>' : '')
+      + (scheduled ? '<button onclick="completeObservation(\'' + item.id + '\')">完成</button>' : '')
+      + ((requested || scheduled) ? '<button class="danger" onclick="withdrawObservation(\'' + item.id + '\')">撤回</button>' : '')
+      + '</div></td>'
+      + '</tr>';
+  }).join('') || '<tr><td colspan="9">还没有观测申请</td></tr>';
+}
+
+async function loadAll() {
+  const [sourceList, candidateList, telescopeList, observationList] = await Promise.all([
+    api('/api/source'),
+    api('/api/candidate'),
+    api('/api/telescope'),
+    api('/api/observation')
+  ]);
+  const sources = sourceList.items || [];
+  candidates = candidateList.items || [];
+  telescopes = telescopeList.items || [];
+  observations = observationList.items || [];
+  fillSelect(document.querySelector('#candidate-form [name="source_id"]'), sources, item => item.data.name);
+  fillSelect(document.querySelector('#observation-form [name="candidate_id"]'), candidates, candidateLabel);
+  fillSelect(document.querySelector('#observation-form [name="telescope_id"]'), telescopes, telescopeLabel);
+  renderSimpleRows('candidates', candidates, candidateLabel);
+  renderSimpleRows('telescopes', telescopes, telescopeLabel);
+  renderObservations();
+}
+
+checkHealth();
 </script>
 </body>
 </html>
